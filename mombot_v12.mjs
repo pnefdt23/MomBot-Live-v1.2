@@ -56,11 +56,11 @@ const CONFIG = {
     SIGNATURE_TYPE:  3,
 
     // Trading rules
-    GAP_THRESHOLD:   20,        // Minimum absolute gap in USD
+    GAP_THRESHOLD:   60,        // Minimum absolute gap in USD
     MIN_ASK:         0.30,      // Minimum ask price
     MAX_ASK:         0.60,      // Maximum ask price
-    FIRE_WINDOW_HI:  600,       // ms before close - upper bound
-    FIRE_WINDOW_LO:  350,       // ms before close - lower bound
+    FIRE_WINDOW_HI:  6100,       // ms before close - upper bound
+    FIRE_WINDOW_LO:  6000,       // ms before close - lower bound
 
     // Safeguards — rolling window check
     LOSS_WINDOW_SIZE:    6,    // Look at last N trades
@@ -109,7 +109,10 @@ function formatMarketLabel(openTs, closeTs) {
     const saOpen  = saFmt.format(openDate);
     const saClose = saFmt.format(closeDate);
 
-    const etLabel = `${etOpen}-${etClose} ET`;
+    const etCloseAmPm = etClose.match(/(AM|PM)$/i)?.[0]?.toUpperCase() || '';
+    const etOpenClean = etOpen.replace(/\s*(AM|PM)\s*$/i, '').trim();
+    const etCloseClean = etClose.replace(/\s*(AM|PM)\s*$/i, '').trim();
+    const etLabel = `${etOpenClean}-${etCloseClean}${etCloseAmPm} ET`;
     const saLabel = `${saOpen}-${saClose} SAST`;
     const url     = `https://polymarket.com/event/btc-updown-5m-${closeTs}`;
 
@@ -414,7 +417,7 @@ async function placeTakerBuy(client, tokenId, askPrice, shares, context) {
 // MARKET CYCLE
 // ════════════════════════════════════════════════════════════════════════
 
-async function runCycle(client) {
+async function runCycle(client, lastTradedSlug) {
     const nowTs   = Math.floor(Date.now() / 1000);
     const closeTs = (Math.floor(nowTs / 300) + 1) * 300;
     const openTs  = closeTs - 300;
@@ -423,7 +426,7 @@ async function runCycle(client) {
 
     info('─'.repeat(70));
     info(`CYCLE | ${market.etLabel} | ${market.saLabel}`);
-    info(`Market: btc-updown-5m-${closeTs} | ${market.url}`);
+    info(`Market: btc-updown-5m-${openTs} | ${market.url}`);
     info(`RTDS=${state.rtdsConnected ? 'connected' : 'DISCONNECTED'} | balance=$${state.walletBalance.toFixed(2)} | shares/trade=${sharesForBalance(state.walletBalance)}`);
 
     // Wait for market open
@@ -436,13 +439,17 @@ async function runCycle(client) {
     // Fetch market tokens
     let upToken, dnToken;
     try {
-        const tokens = await fetchMarketTokens(closeTs);
+        const tokens = await fetchMarketTokens(openTs);
         upToken = tokens.upToken;
         dnToken = tokens.dnToken;
         info(`Market tokens fetched | slug=${tokens.slug}`);
+        if (tokens.slug === lastTradedSlug) {
+            info('SKIP | Already traded this market — waiting for next cycle');
+            return { fired: false, won: null, slug: tokens.slug };
+        }
     } catch (e) {
         warn(`Skip cycle — market fetch failed: ${e.message}`);
-        return { fired: false, won: null };
+        return { fired: false, won: null, slug: null };
     }
 
     // Lock PTB
@@ -451,7 +458,7 @@ async function runCycle(client) {
         ptb = await lockPTB(openTs);
     } catch (e) {
         warn(`Skip cycle — PTB lock failed: ${e.message}`);
-        return { fired: false, won: null };
+        return { fired: false, won: null, slug: null };
     }
     const ptbPrice = ptb.price;
 
@@ -488,8 +495,11 @@ async function runCycle(client) {
                 lastLogSec = secsLeft;
                 const timeMarker = inLastSecond ? `${msLeft}ms` : `${secsLeft}s`;
                 info(
-                    `${timeMarker} left | PTB=$${ptbPrice.toFixed(2)} CL=$${cl.toFixed(2)} | ` +
-                    `${dirName} gap=$${gap.toFixed(2)} | Ask:${ask.toFixed(3)} Bid:${bid.toFixed(3)} Liq:${Math.round(liq)}`
+                    `[${market.etLabel} | ${market.saLabel}] ` +
+                    `PTB=$${ptbPrice.toFixed(2)} CL=$${cl.toFixed(2)} | ` +
+                    `${dirName} gap=$${gap.toFixed(2)} | ` +
+                    `${timeMarker} left | ` +
+                    `Ask:${ask.toFixed(3)} Bid:${bid.toFixed(3)} Liq:${Math.round(liq)}`
                 );
             }
 
@@ -507,7 +517,7 @@ async function runCycle(client) {
                     clearInterval(timer);
                     book.ws.close();
                     warn(`SKIP | No valid ask | gap=$${gap.toFixed(2)} | msLeft=${msLeft}`);
-                    resolve({ fired: false, won: null });
+                    resolve({ fired: false, won: null, slug: null });
                     return;
                 }
                 if (ask < CONFIG.MIN_ASK) {
@@ -515,7 +525,7 @@ async function runCycle(client) {
                     clearInterval(timer);
                     book.ws.close();
                     warn(`SKIP | Ask $${ask.toFixed(3)} below MIN $${CONFIG.MIN_ASK} | gap=$${gap.toFixed(2)}`);
-                    resolve({ fired: false, won: null });
+                    resolve({ fired: false, won: null, slug: null });
                     return;
                 }
                 if (ask > CONFIG.MAX_ASK) {
@@ -523,7 +533,7 @@ async function runCycle(client) {
                     clearInterval(timer);
                     book.ws.close();
                     warn(`SKIP | Ask $${ask.toFixed(3)} above MAX $${CONFIG.MAX_ASK} | gap=$${gap.toFixed(2)}`);
-                    resolve({ fired: false, won: null });
+                    resolve({ fired: false, won: null, slug: null });
                     return;
                 }
 
@@ -567,10 +577,10 @@ async function runCycle(client) {
                         });
                     }
 
-                    resolve({ fired: success, won: null }); // outcome determined later
+                    resolve({ fired: success, won: null, slug: tokens.slug }); // outcome determined later
                 } catch (e) {
                     error(`ORDER FAILED | ${e.message}`);
-                    resolve({ fired: false, won: null });
+                    resolve({ fired: false, won: null, slug: null });
                 }
                 return;
             }
@@ -580,7 +590,7 @@ async function runCycle(client) {
                 clearInterval(timer);
                 book.ws.close();
                 info(`NO TRADE | final gap=$${gap.toFixed(2)} | absGap=$${absGap.toFixed(2)} | threshold=$${CONFIG.GAP_THRESHOLD}`);
-                resolve({ fired: false, won: null });
+                resolve({ fired: false, won: null, slug: null });
             }
         }, CONFIG.TICK_INTERVAL);
     });
@@ -672,6 +682,8 @@ async function main() {
     state.walletBalance = await fetchBalance(client);
     info(`Initial wallet balance: $${state.walletBalance.toFixed(2)}`);
 
+    let lastTradedSlug = null;
+
     // Main loop
     while (true) {
         // Safeguard check — rolling window
@@ -705,7 +717,10 @@ async function main() {
         }
 
         try {
-            await runCycle(client);
+            const result = await runCycle(client, lastTradedSlug);
+            if (result && result.slug && result.fired) {
+                lastTradedSlug = result.slug;
+            }
         } catch (e) {
             error(`Cycle error: ${e.message}`);
             error(e.stack);
